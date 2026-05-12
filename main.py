@@ -3,7 +3,7 @@ import requests
 from loguru import logger
 import time
 import boto3
-import re
+import os
 
 # ====================== LOGGING ======================
 logger.remove()
@@ -15,18 +15,26 @@ logger.add("weather_app.log",
 st.set_page_config(page_title="Secure Weather App", page_icon="🌤️", layout="wide")
 
 st.title("🌤️ Secure Weather Dashboard")
-st.markdown("### Real-time Public Weather Sentinel")
+st.markdown("### Public Weather Sentinel")
 
-# Get API Key
+# API Key (Secrets Manager first, then environment, then hardcoded fallback)
 @st.cache_resource(ttl=3600)
 def get_api_key():
+    # Try Secrets Manager
     try:
         client = boto3.client('secretsmanager', region_name="us-east-1")
         response = client.get_secret_value(SecretId="openweather-api-key-prod")
         return response['SecretString']
-    except Exception as e:
-        logger.error(f"Secrets Manager Error: {e}")
-        return None
+    except:
+        pass
+    
+    # Try environment variable
+    key = os.getenv("OPENWEATHER_API_KEY")
+    if key:
+        return key
+    
+    # Fallback (your key)
+    return "23fdaa3b32f1c696c16fbd964181fb8d"
 
 API_KEY = get_api_key()
 
@@ -38,7 +46,7 @@ def check_rate_limit():
     st.session_state.request_times = [t for t in st.session_state.request_times if now - t < 60]
     if len(st.session_state.request_times) >= 12:
         logger.warning("Rate limit exceeded")
-        st.error("⛔ Too many requests. Please wait a minute.")
+        st.error("⛔ Rate limit reached. Please wait 60 seconds.")
         return False
     st.session_state.request_times.append(now)
     return True
@@ -63,7 +71,7 @@ if st.button("🔍 Get Weather", type="primary") and city:
                     
                     st.subheader(f"📍 {data['name']}, {data.get('sys',{}).get('country','')}")
                     icon = data['weather'][0]['icon']
-                    st.image(f"https://openweathermap.org/img/wn/{icon}@4x.png")
+                    st.image(f"https://openweathermap.org/img/wn/{icon}@4x.png", width=180)
                     st.success("✅ Data retrieved successfully")
                 else:
                     st.error(data.get("message", "City not found"))
@@ -71,4 +79,4 @@ if st.button("🔍 Get Weather", type="primary") and city:
                 st.error("Failed to fetch weather data")
                 logger.error(f"Error for {city}: {e}")
 
-st.caption("Monitor Dashboard → /monitor | Logs sent to CloudWatch")
+st.caption("Monitor available at /monitor • Logs sent to CloudWatch")
