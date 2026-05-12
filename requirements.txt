@@ -1,0 +1,6 @@
+streamlit
+requests
+loguru
+boto3
+pandas
+python-dotenv
