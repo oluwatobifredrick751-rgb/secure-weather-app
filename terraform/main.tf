@@ -8,7 +8,6 @@ module "vpc" {
 
   azs            = ["${var.region}a"]
   public_subnets = ["10.0.1.0/24"]
-
   enable_nat_gateway = false
 }
 
@@ -26,9 +25,51 @@ resource "aws_iam_role" "ec2_role" {
   })
 }
 
+# Secrets Manager
 resource "aws_iam_role_policy_attachment" "secrets" {
   role       = aws_iam_role.ec2_role.name
   policy_arn = "arn:aws:iam::aws:policy/SecretsManagerReadWrite"
+}
+
+# SSM
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# Custom CloudWatch Policy (Write + Read)
+resource "aws_iam_policy" "cloudwatch_policy" {
+  name = "${var.project_name}-cloudwatch"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogStreams"
+        ]
+        Resource = "arn:aws:logs:*:*:*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:FilterLogEvents",
+          "logs:GetLogEvents"
+        ]
+        Resource = [
+          "arn:aws:logs:us-east-1:119408973615:log-group:/secure-weather-app/logs:*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "cloudwatch" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = aws_iam_policy.cloudwatch_policy.arn
 }
 
 resource "aws_iam_instance_profile" "profile" {
@@ -48,13 +89,6 @@ resource "aws_security_group" "sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]   # Restrict this later
-  }
-
   egress {
     from_port   = 0
     to_port     = 0
@@ -63,20 +97,14 @@ resource "aws_security_group" "sg" {
   }
 }
 
-# EC2 Instance
+# EC2
 resource "aws_instance" "app" {
-  ami                    = "ami-0a59ec92177ec3fad"   # Amazon Linux 2023
+  ami                    = "ami-0a59ec92177ec3fad"
   instance_type          = var.instance_type
   subnet_id              = module.vpc.public_subnets[0]
   vpc_security_group_ids = [aws_security_group.sg.id]
   iam_instance_profile   = aws_iam_instance_profile.profile.name
   associate_public_ip_address = true
-
-  user_data = <<-EOF
-              #!/bin/bash
-              yum update -y
-              yum install -y nginx git
-              EOF
 
   tags = {
     Name = "${var.project_name}-ec2"
@@ -87,6 +115,6 @@ output "ec2_public_ip" {
   value = aws_instance.app.public_ip
 }
 
-output "ssh_command" {
-  value = "ssh ec2-user@${aws_instance.app.public_ip}"
+output "instance_id" {
+  value = aws_instance.app.id
 }
