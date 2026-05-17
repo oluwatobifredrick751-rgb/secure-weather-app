@@ -1,0 +1,23 @@
+[Unit]
+Description=Streamlit Weather Dashboard Service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/ojeaburu/secure-weather-app
+Environment=PATH=/home/ojeaburu/secure-weather-app/venv/bin
+Environment=OPENWEATHER_API_KEY=your_api_key_here
+ExecStart=/home/ojeaburu/secure-weather-app/venv/bin/streamlit run main.py --server.port 8501 --server.address 127.0.0.1 --server.enableCORS false --server.enableXsrfProtection false
+Restart=always
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=weather-service
+
+[Install]
+WantedBy=multi-user.target

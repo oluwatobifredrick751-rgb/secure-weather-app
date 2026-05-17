@@ -2,59 +2,69 @@ import os
 import re
 import time
 import datetime
-import requests
+from pathlib import Path
+
 import boto3
+import requests
 import streamlit as st
 from loguru import logger
-from collections import Counter
 
-# ====================== LOGGING ======================
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "weather_app.log"
+
 logger.remove()
 logger.add(
-    "weather_app.log",
+    str(LOG_FILE),
     rotation="10 MB",
+    retention="14 days",
     level="INFO",
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {message}",
 )
 
+# ---------------------------------------------------------------------------
+# Streamlit page configuration
+# ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Secure Weather App",
-    page_icon="🌤️",
+    page_title="Weather Dashboard",
+    page_icon="🌦️",
     layout="wide",
 )
 
-st.markdown(
-    "<style>"
-    "body { background: #f3f4f6; }"
-    ".stApp { color: #111827; }"
-    ".card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 18px; padding: 20px; box-shadow: 0 18px 48px rgba(15, 23, 42, 0.08); }"
-    ".card-title { font-size: 1.1rem; font-weight: 700; color: #111827; margin-bottom: 10px; }"
-    ".card-text { color: #6b7280; margin-bottom: 12px; }"
-    ".streamlit-expanderHeader { font-weight: 600; }"
-    "</style>",
-    unsafe_allow_html=True,
-)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-# ======== Security helpers ========
 @st.cache_resource(ttl=3600)
-def get_api_key():
+def get_secrets_manager_client():
+    return boto3.client("secretsmanager")
+
+
+@st.cache_resource(ttl=3600)
+def get_api_key() -> str:
     try:
-        client = boto3.client("secretsmanager", region_name="us-east-1")
-        response = client.get_secret_value(SecretId="openweather-api-key-prod")
+        client = get_secrets_manager_client()
+        secret_name = os.getenv("OPENWEATHER_SECRET_NAME", "openweather-api-key-prod")
+        response = client.get_secret_value(SecretId=secret_name)
+        logger.info("Loaded API key from AWS Secrets Manager", secret_name=secret_name)
         return response["SecretString"]
     except Exception as exc:
-        logger.warning(f"Secrets Manager lookup failed: {exc}")
+        logger.warning("Secrets Manager lookup failed", error=str(exc))
 
     env_key = os.getenv("OPENWEATHER_API_KEY")
     if env_key:
+        logger.info("Loaded API key from environment variable")
         return env_key
 
     fallback_key = os.getenv("OPENWEATHER_API_KEY_FALLBACK", "")
-    return fallback_key
+    if fallback_key:
+        logger.info("Loaded API key from fallback environment variable")
+        return fallback_key
 
-
-def get_app_password() -> str:
-    return os.getenv("APP_PASSWORD", "SecureWeather2026!")
+    raise ValueError("OpenWeather API key is not configured. Set OPENWEATHER_API_KEY or configure Secrets Manager.")
 
 
 def sanitize_city(city: str) -> str:
@@ -65,227 +75,253 @@ def sanitize_city(city: str) -> str:
 
 def check_rate_limit() -> bool:
     now = time.time()
-    if "request_times" not in st.session_state:
-        st.session_state.request_times = []
+    if "request_timestamps" not in st.session_state:
+        st.session_state.request_timestamps = []
 
-    st.session_state.request_times = [ts for ts in st.session_state.request_times if now - ts < 60]
-    if len(st.session_state.request_times) >= 12:
-        logger.warning("Rate limit exceeded")
-        st.error("⛔ Rate limit reached. Please wait 60 seconds.")
+    st.session_state.request_timestamps = [ts for ts in st.session_state.request_timestamps if now - ts < 60]
+    if len(st.session_state.request_timestamps) >= 12:
+        logger.warning("Rate limit reached", request_count=len(st.session_state.request_timestamps))
+        st.error("⛔ Rate limit reached. Try again in a moment.")
         return False
 
-    st.session_state.request_times.append(now)
+    st.session_state.request_timestamps.append(now)
     return True
 
 
-def authenticate(password: str) -> bool:
-    success = password == get_app_password()
-    if success:
-        st.session_state.authenticated = True
-        logger.info("User authenticated successfully")
-    else:
-        st.session_state.authenticated = False
-        logger.warning("Invalid login attempt")
-    return success
+def format_temperature(value: float, units: str) -> str:
+    suffix = "°C" if units == "metric" else "°F"
+    return f"{value:.1f}{suffix}"
 
 
-def initialize_session():
+def wind_label(units: str) -> str:
+    return "m/s" if units == "metric" else "mph"
+
+
+def get_wind_direction(degrees: float) -> str:
+    directions = [
+        "N",
+        "NNE",
+        "NE",
+        "ENE",
+        "E",
+        "ESE",
+        "SE",
+        "SSE",
+        "S",
+        "SSW",
+        "SW",
+        "WSW",
+        "W",
+        "WNW",
+        "NW",
+        "NNW",
+    ]
+    index = int((degrees + 11.25) / 22.5) % 16
+    return directions[index]
+
+
+def fetch_openweather(endpoint: str, city: str, units: str = "metric") -> dict:
+    api_key = get_api_key()
+    url = f"https://api.openweathermap.org/data/2.5/{endpoint}"
+    params = {"q": city, "appid": api_key, "units": units}
+
+    logger.info("Fetching OpenWeather data", endpoint=endpoint, city=city, units=units)
+    response = requests.get(url, params=params, timeout=12)
+    payload = response.json()
+
+    if response.status_code != 200:
+        message = payload.get("message", "Unable to fetch weather data").capitalize()
+        logger.error("OpenWeather API returned error", status=response.status_code, message=message)
+        raise ValueError(message)
+
+    return payload
+
+
+def parse_forecast_by_day(forecast_json: dict) -> list[dict]:
+    timezone_offset = forecast_json.get("city", {}).get("timezone", 0)
+    daily_groups: dict[datetime.date, dict] = {}
+
+    for entry in forecast_json.get("list", []):
+        timestamp = entry.get("dt", 0)
+        local_time = datetime.datetime.utcfromtimestamp(timestamp + timezone_offset)
+        local_date = local_time.date()
+        weather = entry["weather"][0]
+
+        bucket = daily_groups.setdefault(local_date, {
+            "items": [],
+            "temps": [],
+            "humidities": [],
+            "winds": [],
+        })
+
+        bucket["items"].append({
+            "time": local_time,
+            "icon": weather["icon"],
+            "description": weather["description"].title(),
+            "temp": entry["main"]["temp"],
+            "humidity": entry["main"]["humidity"],
+            "wind_speed": entry["wind"]["speed"],
+            "wind_deg": entry["wind"].get("deg", 0),
+        })
+        bucket["temps"].append(entry["main"]["temp"])
+        bucket["humidities"].append(entry["main"]["humidity"])
+        bucket["winds"].append(entry["wind"]["speed"])
+
+    forecast_days = []
+    for day, values in sorted(daily_groups.items()):
+        representative = min(
+            values["items"],
+            key=lambda item: abs(item["time"].hour - 12),
+        )
+        forecast_days.append({
+            "date": day,
+            "icon": representative["icon"],
+            "description": representative["description"],
+            "min_temp": min(values["temps"]),
+            "max_temp": max(values["temps"]),
+            "humidity": sum(values["humidities"]) / len(values["humidities"]),
+            "wind_speed": sum(values["winds"]) / len(values["winds"]),
+            "wind_direction": get_wind_direction(representative["wind_deg"]),
+        })
+
+    return forecast_days[:5]
+
+
+def render_page_styles() -> None:
+    st.markdown(
+        "<style>"
+        "body { background: linear-gradient(180deg, #eef2ff 0%, #f8fafc 100%); }"
+        ".stApp { color: #111827; }"
+        ".card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 20px; padding: 18px; box-shadow: 0 20px 50px rgba(15, 23, 42, 0.08); }"
+        ".card-title { font-size: 1rem; font-weight: 700; margin-bottom: 10px; }"
+        ".metric-text { color: #4b5563; font-size: 0.95rem; margin: 2px 0; }"
+        "</style>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_current_weather(current_weather: dict, units: str) -> None:
+    weather = current_weather["weather"][0]
+    visibility_km = current_weather.get("visibility", 0) / 1000
+    unit_label = wind_label(units)
+
+    st.subheader(f"Current weather in {current_weather['name']}, {current_weather['sys'].get('country', '')}")
+    with st.container():
+        cols = st.columns([2, 1], gap="large")
+        with cols[0]:
+            st.markdown(f"### {weather['description'].title()}")
+            st.markdown(f"**Temperature:** {format_temperature(current_weather['main']['temp'], units)}")
+            st.markdown(f"**Feels like:** {format_temperature(current_weather['main']['feels_like'], units)}")
+            st.markdown(f"**Humidity:** {current_weather['main']['humidity']}%")
+            st.markdown(f"**Pressure:** {current_weather['main']['pressure']} hPa")
+            st.markdown(f"**Visibility:** {visibility_km:.1f} km")
+            st.markdown(f"**Wind:** {current_weather['wind']['speed']:.1f} {unit_label} ({get_wind_direction(current_weather['wind'].get('deg', 0))})")
+        with cols[1]:
+            st.image(f"https://openweathermap.org/img/wn/{weather['icon']}@4x.png", width=220)
+
+
+def render_forecast_cards(forecast_days: list[dict], units: str) -> None:
+    if not forecast_days:
+        st.warning("No forecast data available. Search for a city to show the 5-day outlook.")
+        return
+
+    cards = st.columns(len(forecast_days), gap="large")
+    for forecast, card in zip(forecast_days, cards):
+        with card:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.markdown(f"<div class='card-title'>{forecast['date'].strftime('%A, %b %d')}</div>", unsafe_allow_html=True)
+            st.image(f"https://openweathermap.org/img/wn/{forecast['icon']}@2x.png", width=90)
+            st.markdown(f"**{forecast['description']}**")
+            st.markdown(f"<div class='metric-text'>Min: {format_temperature(forecast['min_temp'], units)}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='metric-text'>Max: {format_temperature(forecast['max_temp'], units)}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='metric-text'>Humidity: {forecast['humidity']:.0f}%</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='metric-text'>Wind: {forecast['wind_speed']:.1f} {wind_label(units)} {forecast['wind_direction']}</div>", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+
+def initialize_session() -> None:
     defaults = {
-        "authenticated": False,
-        "request_times": [],
+        "last_city": "London",
+        "last_units": "metric",
         "weather_data": None,
         "forecast_data": None,
-        "last_city": "",
-        "last_units": "metric",
+        "request_timestamps": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
-def format_temperature(value: float, units: str) -> str:
-    symbol = "°C" if units == "metric" else "°F"
-    return f"{value:.1f}{symbol}"
+def build_dashboard() -> None:
+    render_page_styles()
+    st.title("🌦️ Weather Dashboard")
+    st.markdown("A clean public weather dashboard with 5-day forecast grouping, OpenWeatherMap integration, and built-in rate limiting.")
 
+    with st.sidebar:
+        st.header("Search & settings")
+        city_input = st.text_input("City", value=st.session_state.get("last_city", "London"))
+        units = st.radio("Units", ["Celsius", "Fahrenheit"], horizontal=True)
+        unit_code = "metric" if units == "Celsius" else "imperial"
+        search_button = st.button("Search")
+        st.markdown("---")
+        st.markdown("**Usage**")
+        st.markdown("- 12 requests per minute maximum")
+        st.markdown("- Forecast uses `/data/2.5/forecast`")
+        st.markdown("- API key from AWS Secrets Manager or `OPENWEATHER_API_KEY`")
 
-def parse_daily_forecast(forecast_json: dict) -> list[dict]:
-    groups: dict[datetime.date, dict] = {}
-    timezone_offset = forecast_json.get("city", {}).get("timezone", 0)
-
-    for entry in forecast_json.get("list", []):
-        ts = entry.get("dt", 0)
-        local_time = datetime.datetime.utcfromtimestamp(ts + timezone_offset)
-        day = local_time.date()
-        weather = entry["weather"][0]
-
-        bucket = groups.setdefault(day, {
-            "temps": [],
-            "humidity": [],
-            "icons": [],
-            "descriptions": [],
-        })
-        bucket["temps"].append(entry["main"]["temp"])
-        bucket["humidity"].append(entry["main"]["humidity"])
-        bucket["icons"].append(weather["icon"])
-        bucket["descriptions"].append(weather["description"])
-
-    daily = []
-    for day, values in groups.items():
-        icon = Counter(values["icons"]).most_common(1)[0][0]
-        description = Counter(values["descriptions"]).most_common(1)[0][0]
-        daily.append(
-            {
-                "date": day,
-                "icon": icon,
-                "min_temp": min(values["temps"]),
-                "max_temp": max(values["temps"]),
-                "description": description.title(),
-                "humidity": sum(values["humidity"]) / len(values["humidity"]),
-            }
-        )
-
-    daily.sort(key=lambda item: item["date"])
-    return daily[:5]
-
-
-def fetch_openweather(endpoint: str, city: str, units: str = "metric") -> dict:
-    api_key = get_api_key()
-    if not api_key:
-        logger.error("OpenWeather API key is missing")
-        raise ValueError("API key is not configured. Set it in AWS Secrets Manager or OPENWEATHER_API_KEY.")
-
-    url = f"https://api.openweathermap.org/data/2.5/{endpoint}"
-    params = {"q": city, "appid": api_key, "units": units}
-    logger.info(f"Fetching {endpoint} for city={city} units={units}")
-
-    response = requests.get(url, params=params, timeout=12)
-    payload = response.json()
-    if response.status_code != 200:
-        message = payload.get("message", "Unable to fetch weather data")
-        logger.error(f"OpenWeather error {response.status_code}: {message}")
-        raise ValueError(message)
-
-    return payload
-
-
-def render_current_weather(data: dict, units: str) -> None:
-    wind_label = "m/s" if units == "metric" else "mph"
-    weather = data["weather"][0]
-
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    cols = st.columns([1, 1, 1, 1])
-    cols[0].metric("Temperature", format_temperature(data["main"]["temp"], units))
-    cols[1].metric("Feels Like", format_temperature(data["main"]["feels_like"], units))
-    cols[2].metric("Humidity", f"{data['main']['humidity']}%")
-    cols[3].metric("Wind", f"{data['wind']['speed']:.1f} {wind_label}")
-
-    st.markdown(f"### 📍 {data['name']}, {data.get('sys', {}).get('country', '')}")
-    st.image(f"https://openweathermap.org/img/wn/{weather['icon']}@4x.png", width=180)
-    st.markdown(f"**{weather['description'].title()}**")
-    st.markdown("**Pressure:** " f"{data['main']['pressure']} hPa  ")
-    st.markdown("**Visibility:** " f"{data.get('visibility', 0) / 1000:.1f} km")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def render_forecast_cards(forecast_days: list[dict], units: str) -> None:
-    if not forecast_days:
-        st.warning("No forecast data is available.")
-        return
-
-    for chunk_start in range(0, len(forecast_days), 3):
-        row = forecast_days[chunk_start : chunk_start + 3]
-        cols = st.columns(len(row), gap="large")
-        for forecast, col in zip(row, cols):
-            with col:
-                col.markdown("<div class='card'>", unsafe_allow_html=True)
-                col.markdown(f"<div class='card-title'>{forecast['date'].strftime('%A, %b %d')}</div>", unsafe_allow_html=True)
-                col.image(f"https://openweathermap.org/img/wn/{forecast['icon']}@2x.png", width=120)
-                col.markdown(f"<div class='card-text'>{forecast['description']}</div>", unsafe_allow_html=True)
-                col.metric("Min", format_temperature(forecast['min_temp'], units))
-                col.metric("Max", format_temperature(forecast['max_temp'], units))
-                col.markdown(f"**Humidity:** {forecast['humidity']:.0f}%")
-                col.markdown("</div>", unsafe_allow_html=True)
-
-
-def render_login_panel() -> None:
-    st.sidebar.markdown("## 🔐 Secure Login")
-    password = st.sidebar.text_input("Password", type="password")
-    if st.sidebar.button("Sign in"):
-        if authenticate(password):
-            st.sidebar.success("Authenticated")
-            st.experimental_rerun()
+    if search_button:
+        city = sanitize_city(city_input)
+        if not city:
+            st.error("Please enter a valid city name.")
+            logger.warning("Invalid city search", raw_input=city_input)
+        elif not check_rate_limit():
+            logger.warning("Rate-limited search attempt", city=city)
         else:
-            st.sidebar.error("Invalid password")
+            try:
+                with st.spinner("Loading weather data..."):
+                    forecast = fetch_openweather("forecast", city, unit_code)
+                    current = fetch_openweather("weather", city, unit_code)
+                    st.session_state.weather_data = current
+                    st.session_state.forecast_data = forecast
+                    st.session_state.last_city = city
+                    st.session_state.last_units = unit_code
+                    logger.info("Weather refresh successful", city=city, units=unit_code)
+            except ValueError as exc:
+                st.error(str(exc))
+            except requests.RequestException as exc:
+                st.error("Unable to reach OpenWeatherMap. Please try again later.")
+                logger.error("HTTP request failed", error=str(exc), city=city)
+            except Exception as exc:
+                st.error("An unexpected error occurred while fetching weather data.")
+                logger.exception("Unexpected error during weather fetch")
+
+    weather_data = st.session_state.get("weather_data")
+    forecast_data = st.session_state.get("forecast_data")
+    active_units = st.session_state.get("last_units", unit_code)
+
+    tabs = st.tabs(["Current Weather", "5-Day Forecast"])
+
+    with tabs[0]:
+        if weather_data:
+            render_current_weather(weather_data, active_units)
+        else:
+            st.info("Search for a city in the sidebar to display the current weather.")
+
+    with tabs[1]:
+        if forecast_data:
+            daily_forecast = parse_forecast_by_day(forecast_data)
+            render_forecast_cards(daily_forecast, active_units)
+        else:
+            st.info("Search for a city in the sidebar to display the 5-day forecast.")
+
+    st.markdown("---")
+    st.caption(f"Logs stored to `{LOG_FILE}`")
 
 
-initialize_session()
+def main() -> None:
+    initialize_session()
+    build_dashboard()
 
-if not st.session_state.authenticated:
-    st.title("Secure Weather App")
-    st.markdown("### Authenticate to access current weather and forecast data.")
-    render_login_panel()
-    st.stop()
 
-st.sidebar.success("Authenticated")
-st.sidebar.markdown("---")
-st.sidebar.markdown("Enter a city and choose your preferred temperature units.")
-
-city_raw = st.text_input("City", "Lagos")
-units = st.radio("Units", ["Celsius", "Fahrenheit"], horizontal=True)
-unit_code = "metric" if units == "Celsius" else "imperial"
-search = st.button("🔍 Get Weather")
-
-if search:
-    city = sanitize_city(city_raw)
-    if not city:
-        st.error("Please enter a valid city name.")
-    elif not check_rate_limit():
-        pass
-    else:
-        try:
-            with st.spinner("Fetching weather data..."):
-                st.session_state.weather_data = fetch_openweather("weather", city, unit_code)
-                st.session_state.forecast_data = fetch_openweather("forecast", city, unit_code)
-                st.session_state.last_city = city
-                st.session_state.last_units = unit_code
-                logger.info(f"Weather query success for city={city}")
-        except ValueError as exc:
-            st.error(str(exc).capitalize())
-        except Exception as exc:
-            st.error("Failed to fetch weather data. Please try again.")
-            logger.error(f"Unexpected error for city={city}: {exc}")
-
-if st.session_state.weather_data and st.session_state.forecast_data:
-    weather_data = st.session_state.weather_data
-    forecast_data = st.session_state.forecast_data
-elif st.session_state.last_city:
-    try:
-        weather_data = fetch_openweather("weather", st.session_state.last_city, st.session_state.last_units)
-        forecast_data = fetch_openweather("forecast", st.session_state.last_city, st.session_state.last_units)
-    except Exception:
-        weather_data = None
-        forecast_data = None
-else:
-    weather_data = None
-    forecast_data = None
-
-st.markdown("# 🌤️ Secure Weather Dashboard")
-st.markdown("Modern weather insights with secure access and responsive forecasting.")
-st.divider()
-
-tabs = st.tabs(["Current Weather", "5-Day Forecast"])
-
-with tabs[0]:
-    if weather_data:
-        render_current_weather(weather_data, st.session_state.last_units)
-    else:
-        st.info("Search for a city above to display the current weather.")
-
-with tabs[1]:
-    if forecast_data:
-        forecast_days = parse_daily_forecast(forecast_data)
-        render_forecast_cards(forecast_days, st.session_state.last_units)
-    else:
-        st.info("Search for a city above to display the 5-day forecast.")
-
-st.caption("Monitor available at /monitor • Logs stored locally and ready for CloudWatch ingestion.")
+if __name__ == "__main__":
+    main()

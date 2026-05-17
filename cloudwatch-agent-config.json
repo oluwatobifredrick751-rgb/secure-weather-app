@@ -1,0 +1,57 @@
+{
+  "agent": {
+    "run_as_user": "root",
+    "metrics_collection_interval": 60,
+    "debug": false
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/home/ojeaburu/secure-weather-app/logs/weather_app.log",
+            "log_group_name": "/secure-weather-app/weather-app",
+            "log_stream_name": "{instance_id}",
+            "timezone": "Local"
+          },
+          {
+            "file_path": "/var/log/nginx/streamlit_access.log",
+            "log_group_name": "/secure-weather-app/nginx-access",
+            "log_stream_name": "{instance_id}",
+            "timezone": "Local"
+          },
+          {
+            "file_path": "/var/log/nginx/streamlit_error.log",
+            "log_group_name": "/secure-weather-app/nginx-error",
+            "log_stream_name": "{instance_id}",
+            "timezone": "Local"
+          }
+        ]
+      },
+      "journal": {
+        "collect_list": [
+          {
+            "log_group_name": "/secure-weather-app/weather-service-journal",
+            "log_stream_name": "{instance_id}",
+            "timezone": "Local",
+            "filters": {
+              "systemd_unit_names": [
+                "weather.service"
+              ]
+            }
+          },
+          {
+            "log_group_name": "/secure-weather-app/monitor-service-journal",
+            "log_stream_name": "{instance_id}",
+            "timezone": "Local",
+            "filters": {
+              "systemd_unit_names": [
+                "monitor.service"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}
