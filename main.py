@@ -59,12 +59,10 @@ def get_api_key() -> str:
         logger.info("Loaded API key from environment variable")
         return env_key
 
-    fallback_key = os.getenv("OPENWEATHER_API_KEY_FALLBACK", "")
-    if fallback_key:
-        logger.info("Loaded API key from fallback environment variable")
-        return fallback_key
-
-    raise ValueError("OpenWeather API key is not configured. Set OPENWEATHER_API_KEY or configure Secrets Manager.")
+    raise ValueError(
+        "OpenWeather API key is not configured. Set OPENWEATHER_API_KEY or configure Secrets Manager. "
+        "Do not hard-code API keys in source code."
+    )
 
 
 def sanitize_city(city: str) -> str:
